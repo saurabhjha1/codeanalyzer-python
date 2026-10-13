@@ -57,7 +57,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from codeanalyzer.neo4j.rows import (
-    CAN_NODE, EdgeRow, GraphRows, NodeRow, application_prefix, chunk, descendant_prefix,
+    CAN_NODE, EdgeRow, GraphRows, NodeRef, NodeRow, RowBuilder, application_prefix,
+    chunk, descendant_prefix, normalize_node,
 )
 from codeanalyzer.neo4j.schema import CONSTRAINTS, INDEXES
 from codeanalyzer.utils import logger
@@ -91,6 +92,205 @@ class BoltConfig:
     user: str
     password: str
     database: Optional[str] = None
+
+
+class _BoltNodeStreamBuilder(RowBuilder):
+    """Bounded node batches, symbol keys, and at most one module's purge IDs."""
+
+    def __init__(self, session, neo4j, changed, app_prefix, eager):
+        super().__init__()
+        self._session, self._neo4j = session, neo4j
+        self._changed, self._app_prefix, self._eager = changed, app_prefix, eager
+        self._pending, self._waiting = [], set()
+        self.symbol_owners = {}
+        self._module = self._module_id = None
+        self._module_keys = set()
+        self.emitted = 0
+        self.completed_modules = 0
+
+    def begin_module(self, file_key, module):
+        self._flush()
+        self._module, self._module_id = file_key, module.id
+        self._module_keys = set()
+        if self._eager and file_key in self._changed:
+            if not module.id or not module.id.startswith(self._app_prefix):
+                raise ValueError(f"neo4j: module {file_key!r} has no can:// id under "
+                                 f"{self._app_prefix!r}; refusing to purge")
+            with self._session() as s:
+                s.execute_write(lambda tx: tx.run(
+                    PURGE_MODULE_EDGES, mid=module.id, pre=descendant_prefix(module.id)
+                ).consume())
+
+    def end_module(self):
+        self._flush()
+        if self._eager and self._module in self._changed:
+            with self._session() as s:
+                s.execute_write(lambda tx: tx.run(
+                    PURGE_VANISHED_NODES, mid=self._module_id,
+                    pre=descendant_prefix(self._module_id), keys=list(self._module_keys),
+                ).consume())
+        self._module = self._module_id = None
+        self._module_keys.clear()
+        self.completed_modules += 1
+        if self.completed_modules % 250 == 0:
+            logger.info(f"neo4j(bolt): node pass completed {self.completed_modules} modules")
+
+    def node(self, labels, key_prop, value, props):
+        labels, props, module = normalize_node(labels, key_prop, value, props)
+        identity = (labels[0], value)
+        if labels[0] == "PySymbol":
+            self._keys.add(identity)
+            if module is not None or value not in self.symbol_owners:
+                self.symbol_owners[value] = module
+        ref = NodeRef(labels[0], key_prop, value, module)
+        if module is not None:
+            if module != self._module:
+                raise ValueError("neo4j: owned node emitted outside its module boundary")
+            if module not in self._changed:
+                return ref
+            if self._eager:
+                self._module_keys.add(value)
+        if labels[0] == "PyModule":
+            # Publish hashes only after the entire push succeeds. Otherwise a
+            # retry after a failed batch could mistake a partial module for an
+            # unchanged one and skip its missing nodes/relationships forever.
+            props.pop("content_hash", None)
+        # MERGE rows for a repeated node must execute in emission order, even
+        # across label groups. Never put one node twice in a statement.
+        if identity in self._waiting:
+            self._flush()
+        self._pending.append(NodeRow(list(labels), key_prop, value, props, module))
+        self._waiting.add(identity)
+        if len(self._pending) >= BATCH:
+            self._flush()
+        return ref
+
+    def edge(self, *args, **kwargs):
+        return None
+
+    def edge_to_symbol(self, *args, **kwargs):
+        return None
+
+    def _flush(self):
+        if self._pending:
+            _upsert_nodes(self._session, self._neo4j, self._pending)
+            self.emitted += len(self._pending)
+            self._pending.clear()
+            self._waiting.clear()
+
+    def finish(self):
+        self._flush()
+        return GraphRows([], [])
+
+
+class _BoltEdgeStreamBuilder(RowBuilder):
+    """Stream relationships after all nodes have been created and reconciled."""
+
+    def __init__(self, session, neo4j, changed, keys, symbol_owners, module_owners):
+        super().__init__()
+        self._session, self._neo4j, self._changed = session, neo4j, changed
+        self._keys, self._symbol_owners = keys, symbol_owners
+        self._module_owners = module_owners
+        self._pending, self._waiting = [], set()
+        self.emitted = 0
+
+    def node(self, labels, key_prop, value, props):
+        return NodeRef(labels[0], key_prop, value, props.get("_module"))
+
+    def edge(self, type_, from_ref, to_ref, props=None, key=None):
+        owner = from_ref.module
+        if owner is None and from_ref.label == "PySymbol":
+            owner = self._symbol_owners.get(from_ref.value)
+        elif owner is None and from_ref.label == "PyBodyNode":
+            owner = self._module_owners.get(from_ref.value)
+        if owner is not None and owner not in self._changed:
+            return
+        identity = (type_, from_ref, to_ref, key)
+        if identity in self._waiting:
+            self._flush()
+        self._pending.append(EdgeRow(type_, from_ref, to_ref, dict(props or {}), key))
+        self._waiting.add(identity)
+        if len(self._pending) >= BATCH:
+            self._flush()
+
+    def edge_to_symbol(self, type_, from_ref, target_ref, props=None):
+        if (target_ref.label, target_ref.value) in self._keys:
+            self.edge(type_, from_ref, target_ref, props)
+
+    def _flush(self):
+        if self._pending:
+            _upsert_edges(self._session, self._neo4j, self._pending)
+            self.emitted += len(self._pending)
+            self._pending.clear()
+            self._waiting.clear()
+
+    def finish(self):
+        self._flush()
+        return GraphRows([], [])
+
+
+def bolt_writer_streaming(app, app_name, sig_to_id, analyzer, cfg, full_run, eager=False):
+    """Project directly to bounded Bolt batches, without a full GraphRows copy.
+
+    Nodes (including unchanged symbols' filter keys) are visited first. Eager
+    reconciliation retains IDs for one module at a time and finishes before any
+    relationships are written. Only module metadata and symbol keys survive
+    between passes; the canonical analysis remains in memory.
+    """
+    try:
+        import neo4j
+    except ImportError as exc:
+        raise RuntimeError("The 'neo4j' driver is required for a live Bolt push. "
+                           "Install it with: pip install 'codeanalyzer-python[neo4j]'") from exc
+    from codeanalyzer.neo4j.project import ModuleSourceOwners, project
+
+    app_prefix = application_prefix(app_name)
+    driver = neo4j.GraphDatabase.driver(cfg.uri, auth=(cfg.user, cfg.password))
+    def session():
+        return driver.session(**({"database": cfg.database} if cfg.database else {}))
+    try:
+        # Connect before projecting: configuration errors fail without building
+        # another graph, and every result is consumed before opening another batch.
+        with session() as s:
+            for stmt in [*CONSTRAINTS, *INDEXES]:
+                s.run(stmt).consume()
+            db_hash = {rec["k"]: rec["h"] for rec in s.run(
+                f"MATCH (m:PyModule:{CAN_NODE}) WHERE m.id STARTS WITH $app "
+                "RETURN m.id AS k, m.content_hash AS h", app=app_prefix,
+            )}
+        changed = {key for key, mod in app.symbol_table.items()
+                   if mod.id not in db_hash or mod.content_hash is None
+                   or mod.content_hash != db_hash[mod.id]}
+        del db_hash
+        logger.info(f"neo4j(bolt): streaming {len(app.symbol_table)} modules "
+                    f"({len(changed)} changed); node pass")
+        nodes = _BoltNodeStreamBuilder(session, neo4j, changed, app_prefix, eager)
+        project(app, app_name, sig_to_id, analyzer=analyzer, builder=nodes, module_scoped=True)
+        keys, owners, node_count = nodes._keys, nodes.symbol_owners, nodes.emitted
+        del nodes
+        logger.info(f"neo4j(bolt): {node_count} node emissions written; relationship pass")
+        edges = _BoltEdgeStreamBuilder(session, neo4j, changed, keys, owners, ModuleSourceOwners(app))
+        project(app, app_name, sig_to_id, analyzer=analyzer, builder=edges)
+        logger.info(f"neo4j(bolt): {edges.emitted} relationship emissions written")
+        if full_run and eager:
+            with session() as s:
+                result = s.run(PRUNE_VANISHED_MODULES, app=app_prefix,
+                               present=[mod.id for mod in app.symbol_table.values()])
+                rec = result.single()
+                logger.info(f"neo4j(bolt): pruned {rec['pruned'] if rec else 0} vanished module(s)")
+        hashes = []
+        for key in changed:
+            mod = app.symbol_table[key]
+            if mod.content_hash is not None:
+                hashes.append(NodeRow(["PyModule"], "id", mod.id,
+                                      {"content_hash": mod.content_hash}))
+            if len(hashes) >= BATCH:
+                _upsert_nodes(session, neo4j, hashes)
+                hashes.clear()
+        if hashes:
+            _upsert_nodes(session, neo4j, hashes)
+    finally:
+        driver.close()
 
 
 def bolt_writer(rows: GraphRows, cfg: BoltConfig, full_run: bool, eager: bool = False) -> None:
@@ -245,7 +445,7 @@ def _upsert_nodes(session, neo4j, nodes: List[NodeRow]) -> None:
         for batch in chunk(group, BATCH):
             payload = [{"k": n.value, "p": _to_params(n.props, neo4j)} for n in batch]
             with session() as s:
-                s.run(cypher, rows=payload)
+                s.run(cypher, rows=payload).consume()
 
 
 def _upsert_edges(session, neo4j, edges: List[EdgeRow]) -> None:
@@ -281,7 +481,7 @@ def _upsert_edges(session, neo4j, edges: List[EdgeRow]) -> None:
                 for e in batch
             ]
             with session() as s:
-                s.run(cypher, rows=payload)
+                s.run(cypher, rows=payload).consume()
 
 
 # ----------------------------------------------------------------------------------------------

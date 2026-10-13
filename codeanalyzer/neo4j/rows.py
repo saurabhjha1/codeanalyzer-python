@@ -44,6 +44,8 @@ class NodeRef:
     label: str  # the label carrying the uniqueness constraint (e.g. "PySymbol", "PyModule")
     key_prop: str  # "signature" | "file_key" | "name" | "id"
     value: str
+    # Projection-only ownership; never part of graph identity or driver params.
+    module: Optional[str] = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -163,7 +165,13 @@ class RowBuilder:
         else:
             self._nodes[node_id] = NodeRow(list(labels), key_prop, value, props, module)
         self._keys.add((labels[0], value))
-        return NodeRef(labels[0], key_prop, value)
+        return NodeRef(labels[0], key_prop, value, module)
+
+    def begin_module(self, file_key, module) -> None:
+        """Optional streaming boundary; the accumulating builder needs no action."""
+
+    def end_module(self) -> None:
+        """All declarations and program-graph nodes of the module were emitted."""
 
     def edge(self, type_: str, from_ref: NodeRef, to_ref: NodeRef, props: Optional[Props] = None,
              key: Optional[str] = None) -> None:

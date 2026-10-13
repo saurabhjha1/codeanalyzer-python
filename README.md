@@ -590,9 +590,16 @@ inheritance, decorators, and call sites are relationships. At `-a 3`/`-a 4` the 
   wipe, then batched `MERGE`s). Load it with `cypher-shell < graph.cypher`. Needs no extra
   dependencies.
 - **With `--neo4j-uri`** — pushes to a live Neo4j over Bolt **incrementally**: only modules whose
-  content hash changed are rewritten, and on a full run modules whose source file vanished are
-  pruned. Requires the `neo4j` extra. Every graph carries a `schema_version` on its `:PyApplication`
-  node.
+  content hash changed are rewritten. `--eager` additionally reconciles vanished declarations
+  and outgoing edges, and on a full run prunes modules whose source file vanished; the default
+  lazy push deletes nothing. Requires the `neo4j` extra. Every graph carries a `schema_version`
+  on its `:PyApplication` node.
+
+Both output paths stream the graph projection. The live writer creates and reconciles nodes
+before emitting relationships, using bounded batches instead of retaining a complete export
+graph. It keeps symbol keys and module metadata, plus one module's current node IDs during
+eager cleanup. The canonical analysis remains in memory. A snapshot benchmark measures file
+export; live-export memory and time should be measured with a Neo4j URI configured.
 
 Call-graph endpoints that aren't present in the symbol table (third-party / framework / RPC targets)
 are materialized as `:PyExternal` ghost nodes, mirroring the analyzer's own ghost-node behaviour.

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Live Neo4j Bolt exports now project directly into bounded node and relationship
+  batches. Previously this path retained a second, complete graph in memory even
+  after the snapshot writer gained streaming in #227. Module hash filtering,
+  lazy upserts, eager vanished-node cleanup, relationship discriminants, and
+  application-scoped orphan pruning are preserved. Export retains symbol keys,
+  module metadata, and at most one changed module's reconciliation IDs; it does
+  not spool the graph to disk. The original analysis remains in memory.
+- A live export connects to Neo4j before projection, so connection failures are
+  reported before the graph walk. Node-pass and relationship-pass progress is
+  logged separately.
+- Module hashes are published only after a successful live push, so a retry
+  after a failed batch does not skip partially written modules as unchanged.
+
 ## [1.6.0] - 2026-10-11
 
 ### Changed
