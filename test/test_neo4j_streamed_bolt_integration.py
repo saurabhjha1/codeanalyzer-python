@@ -17,8 +17,8 @@ pytestmark = pytest.mark.skipif(not os.getenv("CANPY_TEST_NEO4J_URI"),
                                 reason="requires an explicitly supplied disposable Neo4j")
 
 
-def snapshot(driver):
-    with driver.session() as s:
+def snapshot(driver, database):
+    with driver.session(database=database) as s:
         nodes = [{"labels": sorted(r["labels"]), "props": r["props"]}
                  for r in s.run("MATCH (n) RETURN labels(n) AS labels, properties(n) AS props")]
         edges = [{"from": r["a"], "from_labels": sorted(r["al"]), "type": r["t"],
@@ -30,10 +30,12 @@ def snapshot(driver):
 
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("full", [False, True])
-def test_live_incremental_equivalence(eager, full):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_live_incremental_equivalence(eager, full, workers):
     neo4j = pytest.importorskip("neo4j")
     cfg = BoltConfig(os.environ["CANPY_TEST_NEO4J_URI"], "neo4j",
-                     os.environ["CANPY_TEST_NEO4J_PASSWORD"])
+                     os.environ["CANPY_TEST_NEO4J_PASSWORD"],
+                     database=os.getenv("CANPY_TEST_NEO4J_DATABASE", "neo4j"), workers=workers)
     driver = neo4j.GraphDatabase.driver(cfg.uri, auth=(cfg.user, cfg.password))
     app, _ = make_sample_app()
     app.symbol_table["other.py"] = copy.deepcopy(app.symbol_table["service.py"])
@@ -47,7 +49,7 @@ def test_live_incremental_equivalence(eager, full):
     try:
         results = []
         for streaming in (False, True):
-            with driver.session() as s:
+            with driver.session(database=cfg.database) as s:
                 s.run("MATCH (n) DETACH DELETE n").consume()
             # A sibling application with colliding source paths must survive
             # both per-module reconciliation and full-run orphan pruning.
@@ -62,7 +64,7 @@ def test_live_incremental_equivalence(eager, full):
                     bolt_writer_streaming(version, "sample-app", sig, None, cfg, full, eager)
                 else:
                     bolt_writer(project(version, "sample-app", sig), cfg, full, eager)
-                snapshots.append(snapshot(driver))
+                snapshots.append(snapshot(driver, cfg.database))
             results.append(snapshots)
         assert results[0] == results[1]
     finally:

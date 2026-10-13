@@ -598,8 +598,16 @@ inheritance, decorators, and call sites are relationships. At `-a 3`/`-a 4` the 
 Both output paths stream the graph projection. The live writer creates and reconciles nodes
 before emitting relationships, using bounded batches instead of retaining a complete export
 graph. It keeps symbol keys and module metadata, plus one module's current node IDs during
-eager cleanup. The canonical analysis remains in memory. A snapshot benchmark measures file
+eager cleanup. Node buffers hold at most 1,000 rows; relationship buffers hold at most 5,000
+rows per writer to reduce commit overhead. Relationships use two source-partitioned writers
+by default; each retains at most one pending and one submitted batch. Repeated identities can
+trigger an earlier flush to preserve update order. Transient lock conflicts are retried.
+`--neo4j-workers` / `CANPY_NEO4J_WORKERS` sets 1–8 writers; higher concurrency can increase
+lock contention, so benchmark your workload. The canonical analysis remains in memory. A snapshot benchmark measures file
 export; live-export memory and time should be measured with a Neo4j URI configured.
+An eager push into a verified empty database skips cleanup queries. Existing or partially
+written databases retain normal reconciliation. `--neo4j-database` / `NEO4J_DATABASE` selects
+the destination database, including a named database on an Enterprise server.
 
 Call-graph endpoints that aren't present in the symbol table (third-party / framework / RPC targets)
 are materialized as `:PyExternal` ghost nodes, mirroring the analyzer's own ghost-node behaviour.

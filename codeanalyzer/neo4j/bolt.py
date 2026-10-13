@@ -54,6 +54,8 @@ off the default (json) output path entirely.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 from codeanalyzer.neo4j.rows import (
@@ -64,6 +66,9 @@ from codeanalyzer.neo4j.schema import CONSTRAINTS, INDEXES
 from codeanalyzer.utils import logger
 
 BATCH = 1000
+# Relationship payloads are small compared with source/artifact node properties.
+# Use fewer commits for them without increasing the node serialization peak.
+EDGE_BATCH = 5000
 
 # The per-module purge (#173): the module by equality, its subtree by prefix. Anchored
 # on :PyCanNode only so the predicate can seek (see ``rows.CAN_NODE``).
@@ -92,6 +97,7 @@ class BoltConfig:
     user: str
     password: str
     database: Optional[str] = None
+    workers: int = 2
 
 
 class _BoltNodeStreamBuilder(RowBuilder):
@@ -210,7 +216,7 @@ class _BoltEdgeStreamBuilder(RowBuilder):
             self._flush()
         self._pending.append(EdgeRow(type_, from_ref, to_ref, dict(props or {}), key))
         self._waiting.add(identity)
-        if len(self._pending) >= BATCH:
+        if len(self._pending) >= EDGE_BATCH:
             self._flush()
 
     def edge_to_symbol(self, type_, from_ref, target_ref, props=None):
@@ -229,6 +235,64 @@ class _BoltEdgeStreamBuilder(RowBuilder):
         return GraphRows([], [])
 
 
+class _AsyncBoltEdgeStreamBuilder(_BoltEdgeStreamBuilder):
+    """One source partition: a pending batch and at most one submitted batch."""
+
+    def __init__(self, pool, *args):
+        super().__init__(*args)
+        self._pool = pool
+        self.future = None
+
+    def _flush(self):
+        if not self._pending:
+            return
+        if self.future is not None:
+            self.future.result()  # complete this partition's earlier writes first
+        rows, self._pending = self._pending, []
+        self._waiting.clear()
+        self.future = self._pool.submit(self._write, rows)
+        self.emitted += len(rows)
+
+    def _write(self, rows):
+        # A session belongs to one worker only. Retry transient lock conflicts
+        # as a bounded, idempotent MERGE batch; completion hashes remain deferred.
+        with self._session() as s:
+            s.execute_write(lambda tx: _upsert_edges(
+                lambda: nullcontext(tx), self._neo4j, rows,
+            ))
+
+
+class _ParallelBoltEdgeStreamBuilder(_BoltEdgeStreamBuilder):
+    """Bounded source partitions preserve each source's emission order."""
+
+    def __init__(self, session, neo4j, changed, keys, owners, modules, workers):
+        super().__init__(session, neo4j, changed, keys, owners, modules)
+        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="canpy-bolt")
+        self._partitions = [
+            _AsyncBoltEdgeStreamBuilder(self._pool, session, neo4j, changed, keys, owners, modules)
+            for _ in range(workers)
+        ]
+
+    def edge(self, type_, from_ref, to_ref, props=None, key=None):
+        # Re-emissions of any one relationship always use the same FIFO writer.
+        partition = self._partitions[hash(from_ref) % len(self._partitions)]
+        partition.edge(type_, from_ref, to_ref, props, key)
+
+    def finish(self):
+        for partition in self._partitions:
+            partition.finish()
+        for partition in self._partitions:
+            if partition.future is not None:
+                partition.future.result()
+        self.emitted = sum(p.emitted for p in self._partitions)
+        return GraphRows([], [])
+
+    def close(self):
+        # Drain running writes before the driver closes, including on projection
+        # failure. No completion hashes may be published on an unsuccessful pass.
+        self._pool.shutdown(wait=True, cancel_futures=True)
+
+
 def bolt_writer_streaming(app, app_name, sig_to_id, analyzer, cfg, full_run, eager=False):
     """Project directly to bounded Bolt batches, without a full GraphRows copy.
 
@@ -244,6 +308,8 @@ def bolt_writer_streaming(app, app_name, sig_to_id, analyzer, cfg, full_run, eag
                            "Install it with: pip install 'codeanalyzer-python[neo4j]'") from exc
     from codeanalyzer.neo4j.project import ModuleSourceOwners, project
 
+    if not 1 <= cfg.workers <= 8:
+        raise ValueError("neo4j workers must be between 1 and 8")
     app_prefix = application_prefix(app_name)
     driver = neo4j.GraphDatabase.driver(cfg.uri, auth=(cfg.user, cfg.password))
     def session():
@@ -258,21 +324,34 @@ def bolt_writer_streaming(app, app_name, sig_to_id, analyzer, cfg, full_run, eag
                 f"MATCH (m:PyModule:{CAN_NODE}) WHERE m.id STARTS WITH $app "
                 "RETURN m.id AS k, m.content_hash AS h", app=app_prefix,
             )}
+            # A fresh selected database has no stale nodes or edges to purge.
+            # Check the entire database, not just module hashes: a failed prior
+            # push can contain nodes with no committed completion hash.
+            empty_database = s.run("MATCH (n) RETURN count(n) AS count").single()["count"] == 0
         changed = {key for key, mod in app.symbol_table.items()
                    if mod.id not in db_hash or mod.content_hash is None
                    or mod.content_hash != db_hash[mod.id]}
         del db_hash
         logger.info(f"neo4j(bolt): streaming {len(app.symbol_table)} modules "
                     f"({len(changed)} changed); node pass")
-        nodes = _BoltNodeStreamBuilder(session, neo4j, changed, app_prefix, eager)
+        reconcile = eager and not empty_database
+        if eager and empty_database:
+            logger.info("neo4j(bolt): empty database; skipping eager cleanup")
+        nodes = _BoltNodeStreamBuilder(session, neo4j, changed, app_prefix, reconcile)
         project(app, app_name, sig_to_id, analyzer=analyzer, builder=nodes, module_scoped=True)
         keys, owners, node_count = nodes._keys, nodes.symbol_owners, nodes.emitted
         del nodes
         logger.info(f"neo4j(bolt): {node_count} node emissions written; relationship pass")
-        edges = _BoltEdgeStreamBuilder(session, neo4j, changed, keys, owners, ModuleSourceOwners(app))
-        project(app, app_name, sig_to_id, analyzer=analyzer, builder=edges)
+        args = (session, neo4j, changed, keys, owners, ModuleSourceOwners(app))
+        edges = (_ParallelBoltEdgeStreamBuilder(*args, cfg.workers) if cfg.workers > 1
+                 else _BoltEdgeStreamBuilder(*args))
+        try:
+            project(app, app_name, sig_to_id, analyzer=analyzer, builder=edges)
+        finally:
+            if isinstance(edges, _ParallelBoltEdgeStreamBuilder):
+                edges.close()
         logger.info(f"neo4j(bolt): {edges.emitted} relationship emissions written")
-        if full_run and eager:
+        if full_run and reconcile:
             with session() as s:
                 result = s.run(PRUNE_VANISHED_MODULES, app=app_prefix,
                                present=[mod.id for mod in app.symbol_table.values()])
@@ -470,7 +549,7 @@ def _upsert_edges(session, neo4j, edges: List[EdgeRow]) -> None:
             f"MATCH (b:{to_ref.label} {{{to_ref.key_prop}: row.t}}) "
             f"MERGE (a)-[r:{first.type}{rel_key}]->(b) SET r += row.p"
         )
-        for batch in chunk(group, BATCH):
+        for batch in chunk(group, EDGE_BATCH):
             payload = [
                 {
                     "f": e.from_ref.value,

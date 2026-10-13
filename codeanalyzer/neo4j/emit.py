@@ -64,6 +64,7 @@ def emit_neo4j(analysis: Analysis, options: AnalysisOptions) -> None:
             user=options.neo4j_user,
             password=options.neo4j_password,
             database=options.neo4j_database,
+            workers=options.neo4j_workers,
         )
         # A full run (no single-file restriction) makes orphan pruning safe; --eager
         # is what permits any deletion at all (#171).

@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged separately.
 - Module hashes are published only after a successful live push, so a retry
   after a failed batch does not skip partially written modules as unchanged.
+- Live relationship batches hold up to 5,000 rows to reduce commit overhead.
+  Node batches remain capped at 1,000 because source and artifact properties
+  can be much larger than relationship properties.
+- Eager live pushes into a verified empty database skip per-module and orphan
+  cleanup. Program-graph relationships carry their known module ownership
+  directly instead of repeating a module-ID lookup for each edge.
+- Live relationships use two bounded source-partitioned writers by default,
+  with transient transaction retries and per-source write ordering. Set
+  `--neo4j-workers` / `CANPY_NEO4J_WORKERS` to 1–8; more writers may increase
+  contention. Each writer retains at most one pending and one submitted batch.
 
 ## [1.6.0] - 2026-10-11
 

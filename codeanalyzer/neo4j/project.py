@@ -189,8 +189,8 @@ def _global_ordinal(callable_id: str, local_key: str) -> str:
     return global_ordinal(callable_id, local_key)
 
 
-def _body_ref(callable_id: str, local_key: str) -> NodeRef:
-    return NodeRef("PyBodyNode", "id", _global_ordinal(callable_id, local_key))
+def _body_ref(callable_id: str, local_key: str, module: Optional[str] = None) -> NodeRef:
+    return NodeRef("PyBodyNode", "id", _global_ordinal(callable_id, local_key), module)
 
 
 def _project_program_graphs(
@@ -224,7 +224,7 @@ def _project_program_graphs(
         for c in _walk_module_callables(mod):
             if not c.id:
                 continue  # unstamped callable — assign_ids must run first
-            owner = _sym(c.id)  # the :PyCallable node, keyed by its can:// id
+            owner = NodeRef("PySymbol", "id", c.id, file_key)
             # ``callee_signature`` lives on ``PyCallable.call_sites``, not on the body
             # node, so the graph joins the two on the call site's BODY KEY (#203,
             # #215) -- re-derived from the same sequence L1 keyed ``body`` with, so
@@ -282,13 +282,13 @@ def _project_program_graphs(
                 # endpoint pair must stay two relationships, not one MERGE.
                 b.edge(
                     "PY_CFG_NEXT",
-                    _body_ref(c.id, e.src),
-                    _body_ref(c.id, e.dst),
+                    _body_ref(c.id, e.src, file_key),
+                    _body_ref(c.id, e.dst, file_key),
                     {"kind": e.kind},
                     key=e.kind,
                 )
             for e in c.cdg or []:
-                b.edge("PY_CDG", _body_ref(c.id, e.src), _body_ref(c.id, e.dst))
+                b.edge("PY_CDG", _body_ref(c.id, e.src, file_key), _body_ref(c.id, e.dst, file_key))
             for e in c.ddg or []:
                 # (var, prov)-discriminated: the DDG legitimately carries several
                 # edges between one statement pair (one per variable, and the
@@ -296,15 +296,15 @@ def _project_program_graphs(
                 # them and silently drops dependences.
                 b.edge(
                     "PY_DDG",
-                    _body_ref(c.id, e.src),
-                    _body_ref(c.id, e.dst),
+                    _body_ref(c.id, e.src, file_key),
+                    _body_ref(c.id, e.dst, file_key),
                     prune({"var": e.var, "prov": list(e.prov) if e.prov else None}),
                     key=f"{e.var or ''}|{','.join(e.prov or [])}",
                 )
             # L4 intraprocedural summaries (transitive actual_in → actual_out
             # pass-throughs); LOCAL ids resolved to global PyBodyNode refs.
             for e in c.summary or []:
-                b.edge("PY_SUMMARY", _body_ref(c.id, e.src), _body_ref(c.id, e.dst))
+                b.edge("PY_SUMMARY", _body_ref(c.id, e.src, file_key), _body_ref(c.id, e.dst, file_key))
 
     # L4 interprocedural parameter passing, emitted once at the app scope. The
     # endpoints are ALREADY global ordinals (emit_l4 resolved them through the

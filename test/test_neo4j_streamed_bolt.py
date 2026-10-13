@@ -2,6 +2,8 @@
 import copy
 import sys
 import tracemalloc
+from contextlib import nullcontext
+from threading import Barrier, Lock
 from types import SimpleNamespace
 
 import pytest
@@ -40,7 +42,7 @@ class MemoryDB:
         return self
 
     def single(self):
-        return {"pruned": 0}
+        return {"pruned": 0, "count": len(self.nodes)}
 
     def _delete(self, values):
         self.nodes = {k: n for k, n in self.nodes.items() if n.value not in values}
@@ -137,6 +139,7 @@ def test_streaming_buffers_and_reemissions(monkeypatch):
     db = MemoryDB()
     bind(monkeypatch, db)
     monkeypatch.setattr(bolt, "BATCH", 3)
+    monkeypatch.setattr(bolt, "EDGE_BATCH", 3)
     builder = bolt._BoltNodeStreamBuilder(db.session, None, set(), application_prefix("a"), False)
     expected = RowBuilder()
     for i in range(100):
@@ -191,6 +194,32 @@ def test_module_boundaries_include_program_nodes_and_preserve_projection():
     assert owners.get(mid + "X/f()@1:0") is None
 
 
+def test_program_graph_edges_carry_known_source_ownership():
+    app, sig = make_sample_app()
+    rows = project(app, "sample-app", sig)
+    edges = [e for e in rows.edges if e.type in
+             {"PY_HAS_BODY_NODE", "PY_CFG_NEXT", "PY_CDG", "PY_DDG", "PY_SUMMARY"}]
+    assert edges
+    assert all(e.from_ref.module in app.symbol_table for e in edges)
+
+
+def test_fresh_eager_push_skips_purges_but_partial_retry_reconciles(monkeypatch):
+    app, sig = make_sample_app()
+    db = MemoryDB()
+    bind(monkeypatch, db)
+    push(app, sig, eager=True)
+    purges = {bolt.PURGE_MODULE_EDGES, bolt.PURGE_VANISHED_NODES, bolt.PRUNE_VANISHED_MODULES}
+    assert not any(q in purges for q, _ in db.queries)
+    # Simulate a partial previous push: rows exist, but its completion hash
+    # was never committed. A missing hash must not imply an empty database.
+    for node in db.nodes.values():
+        if "PyModule" in node.labels:
+            node.props.pop("content_hash", None)
+    db.queries.clear()
+    push(app, sig, eager=True)
+    assert purges <= {q for q, _ in db.queries}
+
+
 def test_connection_failure_precedes_projection(monkeypatch):
     app, sig = make_sample_app()
     db = MemoryDB()
@@ -206,30 +235,89 @@ def test_connection_failure_precedes_projection(monkeypatch):
     assert db.closed
 
 
-def test_body_node_volume_does_not_grow_export_heap(monkeypatch):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_body_node_volume_does_not_grow_export_heap(monkeypatch, workers):
     # A sink that does not retain rows isolates export overhead from the input
     # analysis and database. Body IDs must not enter the persistent symbol keys.
-    def discard(session, neo4j, rows):
+    def discard_nodes(session, neo4j, rows):
         assert len(rows) <= bolt.BATCH
-    monkeypatch.setattr(bolt, "_upsert_nodes", discard)
-    monkeypatch.setattr(bolt, "_upsert_edges", discard)
+    def discard_edges(session, neo4j, rows):
+        assert len(rows) <= bolt.EDGE_BATCH
+    monkeypatch.setattr(bolt, "_upsert_nodes", discard_nodes)
+    monkeypatch.setattr(bolt, "_upsert_edges", discard_edges)
     nodes = bolt._BoltNodeStreamBuilder(None, None, set(), application_prefix("a"), False)
     tracemalloc.start()
     try:
         for i in range(20000):
             nodes.node(["PyBodyNode"], "id", f"can://a/python/m.py/f()@{i}:0", {"kind": "statement"})
         nodes.finish()
-        edges = bolt._BoltEdgeStreamBuilder(None, None, set(), nodes._keys,
-                                           nodes.symbol_owners, SimpleNamespace(get=lambda _: None))
-        for i in range(20000):
-            edges.edge("PY_DDG", NodeRef("PyBodyNode", "id", f"src-{i}"),
-                       NodeRef("PyBodyNode", "id", f"dst-{i}"), {"var": "x"}, key="x|ssa")
-        edges.finish()
+        session = lambda: nullcontext(SimpleNamespace(execute_write=lambda fn: fn(None)))
+        args = (session, None, set(), nodes._keys, nodes.symbol_owners,
+                SimpleNamespace(get=lambda _: None))
+        edges = (bolt._ParallelBoltEdgeStreamBuilder(*args, workers) if workers > 1
+                 else bolt._BoltEdgeStreamBuilder(*args))
+        try:
+            for i in range(20000):
+                edges.edge("PY_DDG", NodeRef("PyBodyNode", "id", f"src-{i}"),
+                           NodeRef("PyBodyNode", "id", f"dst-{i}"), {"var": "x"}, key="x|ssa")
+            edges.finish()
+        finally:
+            if workers > 1:
+                edges.close()
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
     assert not nodes._keys and not nodes.symbol_owners
-    assert peak < 3 * 1024 * 1024, f"export retained {peak} bytes for 40k rows"
+    assert peak < 32 * 1024 * 1024, f"export retained {peak} bytes for 40k rows"
+
+
+def test_parallel_writes_overlap_and_preserve_repeated_relationship_order(monkeypatch):
+    monkeypatch.setattr(bolt, "EDGE_BATCH", 2)
+    sources = {}
+    for i in range(100):
+        ref = NodeRef("PyBodyNode", "id", str(i))
+        sources.setdefault(hash(ref) % 2, ref)
+    assert len(sources) == 2
+    versions = {ref: [] for ref in sources.values()}
+    barrier, lock = Barrier(2), Lock()
+    def write(session, neo4j, rows):
+        assert len(rows) <= 2
+        if rows[0].props["version"] == 0:
+            barrier.wait(timeout=5)  # both partitions must execute concurrently
+        with lock:
+            for row in rows:
+                versions[row.from_ref].append(row.props["version"])
+    monkeypatch.setattr(bolt, "_upsert_edges", write)
+    db = MemoryDB()
+    builder = bolt._ParallelBoltEdgeStreamBuilder(db.session, None, set(), set(), {},
+                                                  SimpleNamespace(get=lambda _: None), 2)
+    try:
+        for version in range(8):
+            for ref in sources.values():
+                builder.edge("PY_DDG", ref, ref, {"version": version}, key="x|ssa")
+        builder.finish()
+    finally:
+        builder.close()
+    assert all(values == list(range(8)) for values in versions.values())
+    assert builder.emitted == 16
+
+
+def test_larger_relationship_batches_keep_nodes_at_their_smaller_bound(monkeypatch):
+    node_sizes, edge_sizes = [], []
+    monkeypatch.setattr(bolt, "_upsert_nodes", lambda s, n, rows: node_sizes.append(len(rows)))
+    monkeypatch.setattr(bolt, "_upsert_edges", lambda s, n, rows: edge_sizes.append(len(rows)))
+    nodes = bolt._BoltNodeStreamBuilder(None, None, set(), application_prefix("a"), False)
+    edges = bolt._BoltEdgeStreamBuilder(None, None, set(), set(), {}, SimpleNamespace(get=lambda _: None))
+    source = NodeRef("PyBodyNode", "id", "source")
+    for i in range(2 * bolt.EDGE_BATCH + 7):
+        nodes.node(["PyBodyNode"], "id", str(i), {"kind": "statement"})
+        edges.edge("PY_DDG", source, NodeRef("PyBodyNode", "id", str(i)), key=str(i))
+    nodes.finish()
+    edges.finish()
+    assert max(node_sizes) == bolt.BATCH
+    assert max(edge_sizes) == bolt.EDGE_BATCH
+    assert len(edge_sizes) < len(node_sizes)
+    assert sum(node_sizes) == sum(edge_sizes) == 2 * bolt.EDGE_BATCH + 7
 
 
 def test_failed_push_does_not_publish_hash_and_retry_completes(monkeypatch):

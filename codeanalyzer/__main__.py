@@ -131,6 +131,14 @@ def main(
             help="Neo4j database name (default: server default). [env: NEO4J_DATABASE]",
         ),
     ] = None,
+    neo4j_workers: Annotated[
+        int,
+        typer.Option(
+            "--neo4j-workers", min=1, max=8, envvar="CANPY_NEO4J_WORKERS",
+            help="Parallel Bolt relationship writers. Use 1 to serialize writes; higher "
+                 "values may increase lock contention. [env: CANPY_NEO4J_WORKERS]",
+        ),
+    ] = 2,
     analysis_level: Annotated[
         Optional[int],
         typer.Option(
@@ -317,6 +325,7 @@ def main(
         neo4j_user=neo4j_user,
         neo4j_password=neo4j_password,
         neo4j_database=neo4j_database,
+        neo4j_workers=neo4j_workers,
         analysis_level=analysis_level,
         graphs=",".join(selected_graphs),
         graph_field_depth=graph_field_depth,
